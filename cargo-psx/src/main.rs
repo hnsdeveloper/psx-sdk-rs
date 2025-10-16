@@ -1,7 +1,11 @@
 use cargo_metadata::MetadataCommand;
 use clap::{Args, Parser, Subcommand};
-use std::env;
-use std::process::{self, Command, Stdio};
+use std::io::Write;
+use std::{env, fs};
+use std::{fs::File,
+          io::BufWriter,
+          process::{self, Command, Stdio}};
+mod xml;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -16,7 +20,7 @@ struct Cli {
     cargo_args: Vec<String>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Commands {
     Build(BuildArgs),
     Run(BuildArgs),
@@ -53,11 +57,23 @@ struct BuildArgs {
     lto: bool,
     #[arg(long)]
     small: bool,
+    #[arg(long, conflicts_with = "elf", conflicts_with = "debug")]
+    iso: bool,
+    #[arg(long, requires = "iso")]
+    xml: Option<String>,
+    #[arg(long, requires = "iso", conflicts_with = "xml")]
+    path: Option<String>,
+    #[arg(long, requires = "iso", conflicts_with = "xml")]
+    appid: Option<String>,
+    #[arg(long, requires = "iso", conflicts_with = "xml")]
+    volume: Option<String>,
+    #[arg(long, requires = "iso", conflicts_with = "xml")]
+    publisher: Option<String>,
 }
 
 const CARGO_CMD: &str = "cargo";
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Cli::parse();
 
     let mut cargo_args: Vec<String> = opt
@@ -101,7 +117,7 @@ fn main() {
     };
 
     let script = build_args.link.unwrap_or("psexe.ld".to_string());
-    // Set linker script if any
+    //Set linker script if any
     rustflags.push_str(&format!(" -Clink-arg=-T{}", script));
     let format = if build_args.debug || build_args.elf {
         "elf32-tradlittlemips"
@@ -143,11 +159,11 @@ fn main() {
                 let code = status.code().unwrap_or(1);
                 process::exit(code);
             }
-            return;
+            return Ok(());
         }
     }
 
-    let subcmd: &str = opt.command.into();
+    let subcmd: &str = opt.command.clone().into();
     let mut cmd = Command::new(CARGO_CMD);
     cmd.arg(toolchain)
         .arg(subcmd)
@@ -182,4 +198,67 @@ fn main() {
         let code = status.code().unwrap_or(1);
         process::exit(code);
     }
+
+    // Cargo run shouldn't be able to build an iso, as
+    if let Commands::Run(_) | Commands::Check = opt.command {
+        return Ok(())
+    }
+    if !build_args.iso {
+        return Ok(());
+    }
+    // This seems a little bit flaky for me, but it will suffice for now. There are
+    // numerous circumstances where it would break. TODO: Think of a better
+    // solution
+    let target = format!(
+        "{}/mipsel-sony-psx/release/{}.exe",
+        metadata.target_directory.as_str(),
+        metadata.packages[0].name
+    );
+
+    let image_name = metadata.root_package().unwrap().name.clone();
+    let app_id = if let Some(v) = build_args.appid.as_ref() {
+        v.clone()
+    } else {
+        image_name.clone()
+    };
+
+    let xml_path = if let Some(s) = build_args.xml.as_ref() {
+        s.clone()
+    } else {
+        let path = if let Some(p) = build_args.path.as_ref() {
+            p.clone()
+        } else {
+            _ = fs::create_dir("assets");
+            "assets".into()
+        };
+
+        let xml = xml::generate_xml(&path, &image_name, &app_id, &target, build_args.volume.as_ref(), build_args.publisher.as_ref())?;
+        let file_name = format!("{}.xml", &image_name);
+        BufWriter::new(File::create(&file_name)?).write(&xml)?;
+        file_name
+    };
+
+    write_system_cnf(&app_id)?;
+
+    let mut mkpsxiso_cmd = Command::new("mkpsxiso");
+    mkpsxiso_cmd
+        .arg(xml_path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit());
+    let mut child = mkpsxiso_cmd.spawn().expect("mkpsxiso failed to start");
+    let exit_status = child.wait()?;
+    if !exit_status.success() {
+        process::exit(exit_status.code().unwrap_or(1));
+    }
+
+    Ok(())
+}
+
+fn write_system_cnf(app_id: &str) -> Result<(), std::io::Error> {
+    let s = format!(
+        "BOOT=cdrom:\\{}.EXE;1\r\nTCB=4\r\nEVENT=16\r\nSTACK=801FFFF0\r\n",
+        app_id.to_uppercase()
+    );
+    BufWriter::new(File::create("SYSTEM.CNF")?).write(s.as_bytes())?;
+    Ok(())
 }
