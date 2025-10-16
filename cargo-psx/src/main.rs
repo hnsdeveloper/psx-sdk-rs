@@ -1,82 +1,64 @@
 use cargo_metadata::MetadataCommand;
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use std::env;
 use std::process::{self, Command, Stdio};
-use std::str::FromStr;
 
-#[derive(Debug)]
-enum CargoCommand {
-    Build,
-    Check,
-    Run,
-    Test,
-}
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
 
-impl From<CargoCommand> for &'static str {
-    fn from(cmd: CargoCommand) -> &'static str {
-        match cmd {
-            CargoCommand::Build => "build",
-            CargoCommand::Check => "check",
-            CargoCommand::Run => "run",
-            CargoCommand::Test => "test",
-        }
-    }
-}
-
-impl FromStr for CargoCommand {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "build" => Ok(CargoCommand::Build),
-            "check" => Ok(CargoCommand::Check),
-            "run" => Ok(CargoCommand::Run),
-            "test" => Ok(CargoCommand::Test),
-            _ => Err(format!("Invalid cargo command {}", s)),
-        }
-    }
-}
-
-#[derive(Debug, Parser)]
-struct Opt {
-    #[clap(parse(try_from_str), hide = true)]
-    _psx: String,
-
-    #[clap(long, help = "run `cargo clean` before the build subcommand")]
-    clean: bool,
-    #[clap(name = "build|check|run|test", parse(try_from_str))]
-    cargo_subcmd: Option<CargoCommand>,
-
-    #[clap(long, help = "Sets the rustup toolchain (defaults to `nightly`)")]
+    #[arg(short, long)]
     toolchain: Option<String>,
-    #[clap(long, help = "Specifies a custom linker script to use")]
-    link: Option<String>,
-    #[clap(long, help = "Outputs an ELF")]
-    elf: bool,
-    #[clap(long, help = "Ouputs an ELF with debug info")]
-    debug: bool,
-    #[clap(
-        long,
-        help = "Enables link-time optimization and sets codegen units to 1"
-    )]
-    lto: bool,
-    #[clap(long, help = "Sets opt-level=s to optimize for size")]
-    small: bool,
 
-    #[clap(long, help = "Adds a load offset to the executable")]
-    load_offset: Option<u32>,
-
-    #[clap(long, help = "Sets the initial stack pointer")]
-    stack_pointer: Option<u32>,
-
-    #[clap(long)]
+    #[arg(short, long)]
     cargo_args: Vec<String>,
-
-    #[clap(long, help = "Enables the listed features")]
-    features: Option<String>,
 }
+
+#[derive(Subcommand)]
+enum Commands {
+    Build(BuildArgs),
+    Run(BuildArgs),
+    Check,
+    Clean,
+}
+
+impl From<Commands> for &'static str {
+    fn from(cmd: Commands) -> &'static str {
+        match cmd {
+            Commands::Build(_) => "build",
+            Commands::Run(_) => "run",
+            Commands::Check => "check",
+            Commands::Clean => panic!(),
+        }
+    }
+}
+
+#[derive(Args, Default, Clone)]
+struct BuildArgs {
+    #[arg(long)]
+    link: Option<String>,
+    #[arg(long)]
+    features: Option<String>,
+    #[arg(long)]
+    load_offset: Option<u32>,
+    #[arg(long)]
+    stack_pointer: Option<u32>,
+    #[arg(long)]
+    elf: bool,
+    #[arg(long)]
+    debug: bool,
+    #[arg(long)]
+    lto: bool,
+    #[arg(long)]
+    small: bool,
+}
+
+const CARGO_CMD: &str = "cargo";
 
 fn main() {
-    let opt = Opt::parse();
+    let opt = Cli::parse();
 
     let mut cargo_args: Vec<String> = opt
         .cargo_args
@@ -112,10 +94,16 @@ fn main() {
     // Try getting RUSTFLAGS from env
     let mut rustflags = env::var("RUSTFLAGS").ok().unwrap_or(default_rustflags);
 
+    let build_args = match &opt.command {
+        Commands::Build(build_args) | Commands::Run(build_args) => build_args.clone(),
+        Commands::Check => BuildArgs::default(),
+        Commands::Clean => BuildArgs::default(),
+    };
+
+    let script = build_args.link.unwrap_or("psexe.ld".to_string());
     // Set linker script if any
-    let script = opt.link.unwrap_or("psexe.ld".to_string());
     rustflags.push_str(&format!(" -Clink-arg=-T{}", script));
-    let format = if opt.debug || opt.elf {
+    let format = if build_args.debug || build_args.elf {
         "elf32-tradlittlemips"
     } else {
         "binary"
@@ -123,15 +111,15 @@ fn main() {
     rustflags.push_str(&format!(" -Clink-arg=--oformat={}", format));
 
     // Set optional RUSTFLAGS
-    if opt.debug {
+    if build_args.debug {
         rustflags.push_str(" -g");
     }
 
-    if opt.lto {
+    if build_args.lto {
         rustflags.push_str(" -Clto=fat -Cembed-bitcode=yes");
     }
 
-    if opt.small {
+    if build_args.small {
         rustflags.push_str(" -Copt-level=s");
     }
 
@@ -139,8 +127,7 @@ fn main() {
         .exec()
         .expect("Could not parse metadata");
 
-    const CARGO_CMD: &str = "cargo";
-    if opt.clean {
+    if let Commands::Clean = opt.command {
         for pkg in &metadata.packages {
             let mut clean = Command::new(CARGO_CMD)
                 .arg("clean")
@@ -156,45 +143,43 @@ fn main() {
                 let code = status.code().unwrap_or(1);
                 process::exit(code);
             }
+            return;
         }
     }
 
-    if let Some(subcmd) = opt.cargo_subcmd {
-        let subcmd: &str = subcmd.into();
-        let mut cmd = Command::new(CARGO_CMD);
-        cmd.arg(toolchain)
-            .arg(subcmd)
-            .arg(build_std)
-            .arg("-Zbuild-std-features=compiler-builtins-mem")
-            .arg("--target")
-            .arg("mipsel-sony-psx")
-            .args(cargo_args)
-            .env("RUSTFLAGS", rustflags);
-        if let Some(features) = opt.features {
-            cmd.arg("--features").arg(features);
-        }
-        if let Some(offset) = opt.load_offset {
-            assert!(offset % 4 == 0, "Load offset must be a multiple of 4 bytes");
-            cmd.env("PSX_LOAD_OFFSET", offset.to_string());
-        }
-        if let Some(sp) = opt.stack_pointer {
-            assert!(
-                sp % 4 == 0,
-                "Initial stack pointer must be a multiple of 4 bytes"
-            );
-            cmd.env("PSX_STACK_POINTER", sp.to_string());
-        }
-        let mut build = cmd
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect(&format!("`cargo {:?}` failed to start", subcmd));
-
-        let status = build.wait().expect("`cargo build` wasn't running");
-        if !status.success() {
-            let code = status.code().unwrap_or(1);
-            process::exit(code);
-        }
+    let subcmd: &str = opt.command.into();
+    let mut cmd = Command::new(CARGO_CMD);
+    cmd.arg(toolchain)
+        .arg(subcmd)
+        .arg(build_std)
+        .arg("-Zbuild-std-features=compiler-builtins-mem")
+        .arg("--target")
+        .arg("mipsel-sony-psx")
+        .args(cargo_args)
+        .env("RUSTFLAGS", rustflags);
+    if let Some(features) = build_args.features {
+        cmd.arg("--features").arg(features);
+    }
+    if let Some(offset) = build_args.load_offset {
+        assert!(offset % 4 == 0, "Load offset must be a multiple of 4 bytes");
+        cmd.env("PSX_LOAD_OFFSET", offset.to_string());
+    }
+    if let Some(sp) = build_args.stack_pointer {
+        assert!(
+            sp % 4 == 0,
+            "Initial stack pointer must be a multiple of 4 bytes"
+        );
+        cmd.env("PSX_STACK_POINTER", sp.to_string());
+    }
+    let mut build = cmd
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect(&format!("`cargo {:?}` failed to start", subcmd));
+    let status = build.wait().expect("`cargo build` wasn't running");
+    if !status.success() {
+        let code = status.code().unwrap_or(1);
+        process::exit(code);
     }
 }
