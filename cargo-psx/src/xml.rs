@@ -17,7 +17,7 @@ fn traverse_assets(parent: &mut XMLElement, path: &str) -> Result<(), walkdir::E
         });
     for e in wd {
         let entry = e?;
-        if entry.path() == path {
+        if entry.path().to_str().unwrap() == path {
             continue;
         }
         let child = if entry.metadata()?.is_dir() {

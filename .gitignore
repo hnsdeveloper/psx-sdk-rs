@@ -26,3 +26,4 @@ compress/
 *.iso
 tools/
 *.txt
+.DS_Store
